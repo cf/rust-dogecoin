@@ -107,6 +107,38 @@ where
     merkle_root_r(&mut hashes[0..half_len])
 }
 
+/// Compute the merkle root from a merkle tree proof.
+pub fn compute_merkle_root_from_path<T>(index_hash: T, path_hashs: &Vec<T>, index: isize) -> T
+where
+    T: Clone + Hash + Encodable,
+    <T as Hash>::Engine: io::Write,
+{
+    if index == -1 {
+        return T::all_zeros();
+    }
+
+    let mut result = index_hash;
+    let mut index = index;
+
+    for path_hash in path_hashs.iter() {
+        let mut encoder = T::engine();
+        match index & 1 {
+            0 => {
+                result.consensus_encode(&mut encoder).expect("in-memory writers don't error");
+                path_hash.consensus_encode(&mut encoder).expect("in-memory writers don't error");
+            }
+            1 => {
+                path_hash.consensus_encode(&mut encoder).expect("in-memory writers don't error");
+                result.consensus_encode(&mut encoder).expect("in-memory writers don't error");
+            }
+            _ => panic!("invalid index"),
+        };
+        result = T::from_engine(encoder);
+        index >>= 1;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use hashes::sha256d;

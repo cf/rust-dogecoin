@@ -10,7 +10,7 @@
 
 use core::fmt;
 
-use hashes::{Hash, HashEngine};
+use hashes::{scrypt, Hash, HashEngine};
 
 use super::Weight;
 use crate::blockdata::script;
@@ -19,6 +19,7 @@ use crate::consensus::{encode, Decodable, Encodable};
 pub use crate::hash_types::BlockHash;
 use crate::hash_types::{TxMerkleNode, WitnessCommitment, WitnessMerkleNode, Wtxid};
 use crate::internal_macros::impl_consensus_encoding;
+use crate::merkle_tree::compute_merkle_root_from_path;
 use crate::pow::{CompactTarget, Target, Work};
 use crate::prelude::*;
 use crate::{io, merkle_tree, VarInt};
@@ -166,6 +167,84 @@ impl Header {
         BlockHash::from_engine(engine)
     }
 
+    /// Returns the pow hash.
+    pub fn pow_hash(&self) -> BlockHash {
+        let block_header = match &self.aux_data {
+            Some(aux_data) => aux_data.parent_block,
+            None => self.to_simple_header(),
+        };
+
+        let mut block = Vec::new();
+        block_header.consensus_encode(&mut block).expect("consensus encode failed");
+
+        let hash = scrypt::hash(&block);
+        BlockHash::from_slice(&hash).expect("from slice failed")
+    }
+
+    /// check block header
+    pub fn check(&self) -> bool {
+        // check version, chainid todo!()
+
+        /* We have auxpow. Check it.  */
+        if let Some(aux_data) = &self.aux_data {
+            let script = &aux_data.coinbase_tx.input[0].script_sig.to_bytes();
+
+            // check magic number script[0..4] = 0xfabe6d6d
+            let Some(pos) = script.windows(4).position(|w| w == [0xfa, 0xbe, 0x6d, 0x6d]) else {
+                return false;
+            };
+
+            // head 4 + hash 32 + (extranonce, nBits) 8-12
+            if script.len() < pos + 44 {
+                return false;
+            }
+
+            let block_hash = self.block_hash().to_raw_hash();
+            let blockchain_path_hashs = aux_data
+                .blockchain_branch
+                .hashes
+                .iter()
+                .map(|h| h.to_raw_hash())
+                .collect::<Vec<_>>();
+            let computed_blockchain_merkle_root = compute_merkle_root_from_path(
+                block_hash,
+                &blockchain_path_hashs,
+                aux_data.blockchain_branch.side_mask as isize,
+            );
+
+            // merkle branch <=> merkle path
+            // check blockchain branch
+            // script[pos + 4.. pos + 36] = aux_data.blockchain_branch root hash
+            let mut root_hash_array = script[pos + 4..pos + 36].to_vec();
+            root_hash_array.reverse();
+            let root_hash = BlockHash::from_slice(&root_hash_array).expect("from slice error");
+
+            if computed_blockchain_merkle_root != root_hash.to_raw_hash() {
+                return false;
+            }
+
+            // check coinbase branch
+            let txid = aux_data.coinbase_tx.txid().to_raw_hash();
+            let path_hashs =
+                aux_data.coinbase_branch.hashes.iter().map(|h| h.to_raw_hash()).collect::<Vec<_>>();
+            let computed_merkle_root = compute_merkle_root_from_path(
+                txid,
+                &path_hashs,
+                aux_data.coinbase_branch.side_mask as isize,
+            );
+            if computed_merkle_root != aux_data.parent_block.merkle_root.to_raw_hash() {
+                return false;
+            }
+        }
+
+        // check pow hash
+        if self.validate_pow(self.target()).is_err() {
+            return false;
+        }
+
+        true
+    }
+
     /// Computes the target (range [0, T] inclusive) that a blockhash must land in to be valid.
     pub fn target(&self) -> Target {
         self.bits.into()
@@ -187,7 +266,7 @@ impl Header {
         if target != required_target {
             return Err(ValidationError::BadTarget);
         }
-        let block_hash = self.block_hash();
+        let block_hash = self.pow_hash();
         if target.is_met_by(block_hash) {
             Ok(block_hash)
         } else {
@@ -552,6 +631,20 @@ impl Block {
             _ => Err(Bip34Error::NotPresent),
         }
     }
+
+    /// Checks whether the block is valid.
+    pub fn check(&self) -> bool {
+        if !self.header.check() {
+            return false;
+        }
+        if !self.check_merkle_root() {
+            return false;
+        }
+
+        // check transactions todo!()
+
+        true
+    }
 }
 
 impl From<Header> for BlockHash {
@@ -830,6 +923,40 @@ mod tests {
         assert!(!segwit_signal.is_signalling_soft_fork(0));
         assert!(segwit_signal.is_signalling_soft_fork(1));
         assert!(!segwit_signal.is_signalling_soft_fork(2));
+    }
+
+    #[test]
+    fn test_scrypt() {
+        let block = hex::test_hex_unwrap!("020000009368a2b9ce40097ed27c4172a6abe61f8a5bddeb93db1e9d811b3922229a08bd107e3d41ea06ab190e4c9d548dd7af92f43182f9979d292e053dea95ce6d97e15f2db554d25f011ba8c7ca56");
+
+        let mut computed_hash = scrypt::hash(&block).to_vec();
+        computed_hash.reverse();
+
+        let hash = hex::test_hex_unwrap!(
+            "0000000000011b78623a435fe8e86a20a1098b7f514c78996ce1e10f627c742e"
+        );
+
+        assert_eq!(hash, computed_hash);
+    }
+
+    #[test]
+    fn test_pow() {
+        let some_block = hex!("040162002be721f59554324a1d2d09cf664d5e7539ac4bb0cfda9320fa49cfef1ee637b6faadcbfb4a663eb4272055a59416ae2628b4a3c9e9ea9107d5ffd52596f2cb8854f22f646374011a0000000002000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4e03506b2504b1f425b1474c54432f4254432e636f6d2ffabe6d6d2405898c96c767445ef30ccdfe3b615d6da5d974348781ffea5ff6425ece74c701000000000000001b4e93400900000000000000ffffffff02e55d844a000000001976a9141cf77b08e672f1b39ae99fa7b61f4ad0aff5f10388ac0000000000000000266a24aa21a9ed4f8e12027e81153d2dae5b65168a06facfabd37da3b857b49e6bba7909e61f450000000000000000000000d194a4c8bb00a71d4ae878d32007fa4dd528354420235c8b780531ad901c2df34281009be34cf303cf4bd5bf356533ef1bec0c85e45db718b39f173ac9ead8aa7cf13b240daef254c58549bf83ed2aa242308ac34eba662602f2a8f4b9157710bdb10d46d3ca26068697924d9dcb76cdca78f0e938c70dbabcd19df70a010d3a8d31f03da171a6cdefdec8fa49e00b74e4c2abe35da9e4d3aada7eac3380bcee854b85f813429e4556dfa5ee54f1f13d5bd9040e95c3cbb66320000000000000000000000000203320d027dea67123894db182cba645b337a86bf62ad70376a171f75b79189bfc24687145b447f9d6c6eb0d7e9ff6f959e8a698e70c5f7d7b6488487d04264cec53f22f6498b0001a6c45a3e70501000000010000000000000000000000000000000000000000000000000000000000000000ffffffff06032a35470101ffffffff01e0a1d3d4e80000001976a914ce344e1860c1e9e50521860dc1b3a90bc14097aa88ac00000000010000000113c938b01d9bafe1a2b4939f32df91ae22db4cb910450e1d45c73070db042f47000000006b483045022100f18debb5714f4a87bf87da3bc141fcfe7b519ea6ff32c244b6a934383137843e022035c71d00877eab609164f3adce1089dc16d5920ccde0b7abba385d58613da28f012102975a05460682397129b029473c462b0bc7efe65ccb1823210ce814e25629f389ffffffff026e344910680000001976a914a8cb446b4f846d31fb4f5d214ffaaaaac09d297b88ac0078a698200000001976a91467fc0fb53c13a179773b7c15416cb172a5e5a9c788ac000000000100000002b7f8f82bc48cd82d0ce8ed207cc32cc9edc366f8130b4969f9b4e041c9138174010000006b483045022100a5fcb723b89fd27ce460b4f0c53752098c981fe9b05d77000866b90fb40a8089022043b80a84900ca59264d268dd2ef760066cc74253a59d02799c5eaf91021d0d120121026d50509424080183b2936ad0ca47197140b7750232f9c5e67ea97213a6aaf030feffffff826abb1f5e5580141eb7e0d391d8c5b598285920d9af0c84bfc5a48717c2a9390000000049483045022100d639250d192ce710f69b54ca1ad9e2e0c5985c14385bebd6fedbf7ed1e1bb49602205d27fd338119da6433ef1bbe0f7623fe75b204d32f3fdc38feaba79e7b8f837401feffffff0217e8dae0e80000001976a914aae6a94f80accc7775de871ba6bdb181dd26a6bd88aca0822c00000000001976a91487a4309438c4804b7985974bb2f7aabd0e0cdb2588ac2835470001000000013742c6297193e84421f3328c5f6dd411bf31b609ce8489ae635e522c011015db000000006a47304402202699b16460a01299554251d61d3a95193a66b40b78b6256439b7c243f7a7e20a0220267ad65491289d684d55426f0fcf1644975a98af9b64b0dd619de75ba776d93d01210378787e36184e23f3b49248ac55d8556ad4d97489575d682a039ebb54dd1d31d9feffffff0236231864040000001976a914c85aeb2c3377ca6b062dab1bd18ae172d1ca8f0c88acfa8d13fe400000001976a914cdc1863d9bdbf04668113a5c12dd343c1cbb9ee888ac28354700010000000193eb1c1cf26e1b5487a9c17f5e2684c59eecbd97f45740ed3729cda1023077b3010000006a47304402203cebcd1b26b1c8d4bca937ef2df397d54676e2e0b6cbc5166cbdc1d9f78bbfbe022071ed43c440a57c2921150e29695ab042dac0c223909680c12632b95a0c9d5f0a012102ea5ae89718633a81e7e90f7049e200ff4ebe9fb5277704125089639b2fa09b93feffffff0260c106f00f0000001976a914d9b896cccf9847802331f6fcf303b96f2e4ff5da88ac40420f00000000001976a914d151e2118a3b1f86abb45a5b32621342d67d554888ac28354700");
+        let block: Block = deserialize(&some_block).expect("Can't deserialize correct block");
+
+        let pow_hash = block.header.pow_hash();
+        assert_eq!(block.header.validate_pow(block.header.bits.into()), Ok(pow_hash));
+    }
+
+    #[test]
+    fn check_block() {
+        // dogecoin block https://dogechain.info/block/4666666
+        // litecoin privious block https://ltc.tokenview.io/cn/block/2452303
+        let some_block = hex!("040162002be721f59554324a1d2d09cf664d5e7539ac4bb0cfda9320fa49cfef1ee637b6faadcbfb4a663eb4272055a59416ae2628b4a3c9e9ea9107d5ffd52596f2cb8854f22f646374011a0000000002000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4e03506b2504b1f425b1474c54432f4254432e636f6d2ffabe6d6d2405898c96c767445ef30ccdfe3b615d6da5d974348781ffea5ff6425ece74c701000000000000001b4e93400900000000000000ffffffff02e55d844a000000001976a9141cf77b08e672f1b39ae99fa7b61f4ad0aff5f10388ac0000000000000000266a24aa21a9ed4f8e12027e81153d2dae5b65168a06facfabd37da3b857b49e6bba7909e61f450000000000000000000000d194a4c8bb00a71d4ae878d32007fa4dd528354420235c8b780531ad901c2df34281009be34cf303cf4bd5bf356533ef1bec0c85e45db718b39f173ac9ead8aa7cf13b240daef254c58549bf83ed2aa242308ac34eba662602f2a8f4b9157710bdb10d46d3ca26068697924d9dcb76cdca78f0e938c70dbabcd19df70a010d3a8d31f03da171a6cdefdec8fa49e00b74e4c2abe35da9e4d3aada7eac3380bcee854b85f813429e4556dfa5ee54f1f13d5bd9040e95c3cbb66320000000000000000000000000203320d027dea67123894db182cba645b337a86bf62ad70376a171f75b79189bfc24687145b447f9d6c6eb0d7e9ff6f959e8a698e70c5f7d7b6488487d04264cec53f22f6498b0001a6c45a3e70501000000010000000000000000000000000000000000000000000000000000000000000000ffffffff06032a35470101ffffffff01e0a1d3d4e80000001976a914ce344e1860c1e9e50521860dc1b3a90bc14097aa88ac00000000010000000113c938b01d9bafe1a2b4939f32df91ae22db4cb910450e1d45c73070db042f47000000006b483045022100f18debb5714f4a87bf87da3bc141fcfe7b519ea6ff32c244b6a934383137843e022035c71d00877eab609164f3adce1089dc16d5920ccde0b7abba385d58613da28f012102975a05460682397129b029473c462b0bc7efe65ccb1823210ce814e25629f389ffffffff026e344910680000001976a914a8cb446b4f846d31fb4f5d214ffaaaaac09d297b88ac0078a698200000001976a91467fc0fb53c13a179773b7c15416cb172a5e5a9c788ac000000000100000002b7f8f82bc48cd82d0ce8ed207cc32cc9edc366f8130b4969f9b4e041c9138174010000006b483045022100a5fcb723b89fd27ce460b4f0c53752098c981fe9b05d77000866b90fb40a8089022043b80a84900ca59264d268dd2ef760066cc74253a59d02799c5eaf91021d0d120121026d50509424080183b2936ad0ca47197140b7750232f9c5e67ea97213a6aaf030feffffff826abb1f5e5580141eb7e0d391d8c5b598285920d9af0c84bfc5a48717c2a9390000000049483045022100d639250d192ce710f69b54ca1ad9e2e0c5985c14385bebd6fedbf7ed1e1bb49602205d27fd338119da6433ef1bbe0f7623fe75b204d32f3fdc38feaba79e7b8f837401feffffff0217e8dae0e80000001976a914aae6a94f80accc7775de871ba6bdb181dd26a6bd88aca0822c00000000001976a91487a4309438c4804b7985974bb2f7aabd0e0cdb2588ac2835470001000000013742c6297193e84421f3328c5f6dd411bf31b609ce8489ae635e522c011015db000000006a47304402202699b16460a01299554251d61d3a95193a66b40b78b6256439b7c243f7a7e20a0220267ad65491289d684d55426f0fcf1644975a98af9b64b0dd619de75ba776d93d01210378787e36184e23f3b49248ac55d8556ad4d97489575d682a039ebb54dd1d31d9feffffff0236231864040000001976a914c85aeb2c3377ca6b062dab1bd18ae172d1ca8f0c88acfa8d13fe400000001976a914cdc1863d9bdbf04668113a5c12dd343c1cbb9ee888ac28354700010000000193eb1c1cf26e1b5487a9c17f5e2684c59eecbd97f45740ed3729cda1023077b3010000006a47304402203cebcd1b26b1c8d4bca937ef2df397d54676e2e0b6cbc5166cbdc1d9f78bbfbe022071ed43c440a57c2921150e29695ab042dac0c223909680c12632b95a0c9d5f0a012102ea5ae89718633a81e7e90f7049e200ff4ebe9fb5277704125089639b2fa09b93feffffff0260c106f00f0000001976a914d9b896cccf9847802331f6fcf303b96f2e4ff5da88ac40420f00000000001976a914d151e2118a3b1f86abb45a5b32621342d67d554888ac28354700");
+        let block: Block = deserialize(&some_block).expect("Can't deserialize correct block");
+
+        assert_eq!(block.check_merkle_root(), true);
+        assert_eq!(block.check(), true);
     }
 }
 
