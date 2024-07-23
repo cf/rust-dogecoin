@@ -129,6 +129,7 @@ pub mod sha256t;
 pub mod sha512;
 pub mod sha512_256;
 pub mod siphash24;
+pub mod scrypt;
 
 use core::{borrow, fmt, hash, ops};
 // You get I/O if you enable "std" or "core2" (as well as during testing).
